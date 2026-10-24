@@ -94,13 +94,14 @@ const SLOW_POLL_INTERVAL_MS = 10000;
 // the web UI's own nav terminology (src/web/i18n.ts) so each tab reads like
 // the title of the page inside the frame. "connect" stays out: it documents
 // how OTHER clients reach this proxy, which makes no sense from inside dsh.
-const PAGE_IDS = ["overview", "sessions", "config", "logs"] as const;
+const PAGE_IDS = ["overview", "sessions", "config", "logs", "updates"] as const;
 type PageId = (typeof PAGE_IDS)[number];
 const PAGE_KEYS: Record<PageId, string> = {
     overview: "tab_overview",
     sessions: "tab_sessions",
     config: "tab_config",
     logs: "tab_logs",
+    updates: "tab_updates",
 };
 
 // #3816: the exact field a remote user adds to enable the #3373 relay. A
@@ -358,6 +359,7 @@ const zh: Dict = {
     "tab_sessions": "会话",
     "tab_config": "配置",
     "tab_logs": "日志",
+    "tab_updates": "版本",
     "tab_ctx": "上下文",
     "ctx_waiting": "等待首个模型请求…",
     "ctx_nodata": "暂无上下文数据——完成一次模型请求后自动刷新。",
@@ -378,6 +380,7 @@ const en: Dict = {
     "tab_sessions": "Sessions",
     "tab_config": "Config",
     "tab_logs": "Logs",
+    "tab_updates": "Versions",
     "tab_ctx": "Context",
     "ctx_waiting": "Waiting for the first model request…",
     "ctx_nodata": "No context data yet — refreshes automatically after the first model request.",
@@ -393,6 +396,21 @@ function readOrigin(): string | undefined {
     if (snap !== undefined && snap.relay === true) return "";
     const origin = snap?.origin;
     return typeof origin === "string" && origin.length > 0 ? origin : undefined;
+}
+
+/** #4237: Context-tab face flags from the __BILI__ snapshot (host half,
+ *  dsh.contextTab / dsh.contextTabLabel): `hidden` drops the conversation.view
+ *  registration entirely (the top-bar entry only — compression is untouched),
+ *  `label` overrides the built-in "上下文"/"Context" for machines where another
+ *  plugin occupies the same name. Both fail open: absent fields (legacy host,
+ *  pre-bootstrap page load) keep today's behavior byte-identical. */
+function readCtxTabFace(): { hidden: boolean; label: string | undefined } {
+    const g = globalThis as { __BILI__?: { contextTab?: unknown; contextTabLabel?: unknown } };
+    const snap = g.__BILI__;
+    const hidden = snap !== undefined && snap.contextTab === false;
+    const raw = snap?.contextTabLabel;
+    const label = typeof raw === "string" && raw.trim().length > 0 ? raw : undefined;
+    return { hidden, label };
 }
 
 function openExternal(url: string): void {
@@ -812,9 +830,17 @@ export function apply(ctx: ClientContext): void {
     // #3862: session Context tab. order 30 sits right of the built-in chat (0)
     // and trajectory (10) tabs and right of dsh-context's Context tab (20)
     // when both are installed. Deferred injection is fail-open on hosts whose
-    // build lacks the slot.
-    ctx.slots.inject(
-        "conversation.view",
-        () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => t("tab_ctx"), locale: NS }, contextPanel()),
-    );
+    // build lacks the slot. #4237: dsh.contextTab=false (web settings / config
+    // file / BILI_DSH_CONTEXT_TAB=0) skips this slot entirely — hiding removes
+    // only the top-bar entry; the ledger stays reachable through the settings
+    // section, the plugin bundle config face, the Web UI and /acp. A custom
+    // label (dsh.contextTabLabel) replaces the built-in name where another
+    // plugin occupies it.
+    const ctxGate = readCtxTabFace();
+    if (!ctxGate.hidden) {
+        ctx.slots.inject(
+            "conversation.view",
+            () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel()),
+        );
+    }
 }

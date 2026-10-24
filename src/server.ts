@@ -98,8 +98,9 @@ import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type ProxyInstanceFile, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { recordSplitBrainContest } from "./storage/runtime-status.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
@@ -622,6 +623,46 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
 }
 
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+    const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
+    // #1225: lane identity + code fingerprint recorded into the instance file
+    // so later launches can decide reuse by WHO started us and WHICH code we
+    // run — not just config shape (same-version stale dist kept serving after
+    // a rebuild; different clients cross-wrote one shared proxy).
+    const launcherLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
+    const ownFingerprint = entryScriptFingerprint(process.argv[1]);
+    // #3801: our config shape EXACTLY as the registration below will record
+    // it — the byte-stable pair for judging whether a contended-port holder
+    // is a true duplicate or a config-drifted predecessor.
+    const ownShape: InstanceShape = {
+        host: opts.host,
+        passthrough: opts.passthrough,
+        mitmDomains: opts.mitm.enabled ? [...opts.mitm.domains] : [],
+        modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
+        modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
+    };
+    const earlyTwin = await findVerifiedSameLaneTwin(
+        listInstances(),
+        opts.port,
+        launcherLane,
+        ownFingerprint,
+        (entry) => sameInstanceShape(entryShape(entry), ownShape),
+        (origin) => probeOwnerInfo(origin),
+    );
+    if (earlyTwin !== undefined) {
+        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`;
+        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
+        // createEngineContext has not run yet, so its configureLogger call
+        // has not happened either — open the file leg here (mirroring it) so
+        // the adopt line lands in bili.log like the late-path twin line, gate
+        // on opts.log like every other startServer line, and drain the stream
+        // before exiting or the buffered line can be lost with the process.
+        configureLogger(opts.logFile ?? defaultLogFile());
+        logMsg(opts, "error", listenLine);
+        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${new Date().toISOString()} [error] [v=${VERSION}] ${listenLine}`);
+        await closeLogger();
+        process.exit(eaddrinuseExitCode("twin-collision"));
+    }
+
     const engine = await createEngineContext(opts);
     const { core, config, log, instanceId, instanceStartedAt, proxyWatchers, watcherLastSeen, initialWatcherPid, adminCtx } = engine;
 
@@ -943,6 +984,34 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         return n;
     };
     (server as RestartCapableServer)[RESTART_FORCE_CLOSE_KEY] = forceCloseLingeringSockets;
+    // #4380: the linger wrap above defers socket.destroy() for
+    // completed-response sockets, which silently defeats
+    // server.closeAllConnections() — the API's contract is "cut every
+    // tracked connection NOW", but idle keep-alive pooled sockets sit in
+    // the #2895 off-parser class node's own iteration never reaches: they
+    // only die when the peer's pool expires (~3s measured, linger budget
+    // 5s default). Every startServer/close cycle in embedded use (test
+    // teardown, graceful shutdown) paid that per stop — measured as
+    // minutes of pure wall time across the CI suite. Cut exactly the
+    // linger-protected class (completed at least one response, never
+    // errored): stamp the #2895 intentional-cut marker and destroy via the
+    // ledger, then delegate to the original for anything node tracks that
+    // the ledger never recorded. Sockets that never completed a response
+    // (held CONNECT tunnels, claimed upgrades) stay untouched here — plain
+    // closeAllConnections() still cannot cut those (#2895 semantics,
+    // pinned by the auto-restart repro); the restart force-close seam owns
+    // them, as before.
+    const origCloseAllConnections = server.closeAllConnections?.bind(server);
+    if (origCloseAllConnections !== undefined) {
+        server.closeAllConnections = () => {
+            for (const [socket, rec] of [...connRecords]) {
+                if (rec.lastResponseEndAt === null || rec.errored !== null) continue;
+                rec.restartForced = true;
+                socket.destroy();
+            }
+            origCloseAllConnections();
+        };
+    }
     // #1452: Node's default client-error disposition (no listener) writes a
     // bare `HTTP/1.1 400 Bad Request` / Connection: close reply and then
     // destroys the socket (measured Linux/Node 25). Depending on platform
@@ -1024,29 +1093,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // #964: BILI_STRICT_PORT (claude SessionStart hook) opts OUT of the retry
     // — the native posture dials a static baked-in URL, so a port-hop
     // "success" would strand every model request on the dead original port.
-    const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
     const strictPort = process.env.BILI_STRICT_PORT === "1";
     // #3044: a self-restart replacement must own exactly the port its
     // predecessor freed — it fails fast instead of inheriting the +1 ladder
     // (hopping strands it serving no client while the old instance keeps the
     // real port: the orphan leak #3044 reports).
     const upgradeReplacement = process.env[UPGRADE_REPLACEMENT_ENV] === "1";
-    // #1225: lane identity + code fingerprint recorded into the instance file
-    // so later launches can decide reuse by WHO started us and WHICH code we
-    // run — not just config shape (same-version stale dist kept serving after
-    // a rebuild; different clients cross-wrote one shared proxy).
-    const launcherLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
-    const ownFingerprint = entryScriptFingerprint(process.argv[1]);
-    // #3801: our config shape EXACTLY as the registration below will record
-    // it — the byte-stable pair for judging whether a contended-port holder
-    // is a true duplicate or a config-drifted predecessor.
-    const ownShape: InstanceShape = {
-        host: opts.host,
-        passthrough: opts.passthrough,
-        mitmDomains: opts.mitm.enabled ? [...opts.mitm.domains] : [],
-        modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
-        modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
-    };
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;
@@ -1163,9 +1215,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         {
             const markerDir = writerMarkerDir(stateDir());
             servedWriter = createServedMarkerWriter(
-                { instanceId, pid: process.pid, origin, version: VERSION },
+                { instanceId, pid: process.pid, origin, version: VERSION, lane: launcherLane },
                 markerDir,
                 (level, msg) => log(level, msg),
+                {
+                    // #3923/#3959: in-memory peek only — the commit listener
+                    // fires on save, so the session is already resident.
+                    resolveTitle: (id): string | undefined => {
+                        const meta = peekSession(id)?.metadata;
+                        const hostTitle = meta?.hostTitle;
+                        if (typeof hostTitle === "string" && hostTitle !== "") return hostTitle;
+                        const title = meta?.title;
+                        return typeof title === "string" && title !== "" ? title : undefined;
+                    },
+                    onContest: recordSplitBrainContest,
+                },
             );
             reapStaleWriterMarkers(markerDir, Date.now());
             setGlobalSessionCommitListener((id) => servedWriter?.noteServed(id));
@@ -1531,6 +1595,11 @@ export type Prepared = {
      *  response must pass through verbatim, and usage is sniffed instead of
      *  captured by the compress loop. */
     pluginMode?: boolean;
+    /** #4344: this request declared the compress tool ONLY in the MCP dialect
+     *  (mcp__bili__compress, no bare `compress`) — the prepared standing
+     *  prompt carries the MCP name-mapping note (withMcpDialectNote). Threads
+     *  to the round-2 system rebuild for byte-parity. */
+    mcpDialectNote?: boolean;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
@@ -3399,9 +3468,10 @@ export async function preflightCompressIfNeeded(
         // windowShrinkReason (set ONLY by the operator-override and codex-align
         // paths) — NOT just on limit < resolvedNativeWindow: the per-request
         // output-headroom reservation (reserveOutputHeadroom) also lowers
-        // reqConfig.modelContextLimit below native for every non-Anthropic turn
-        // with a max_tokens, so comparing alone would emit this note for a
-        // setting the operator never touched (#737 review).
+        // reqConfig.modelContextLimit below native for every turn whose route
+        // reserves headroom (non-anthropic wires plus anthropic routes lacking
+        // separate-output-budget evidence, #4205), so comparing alone would emit
+        // this note for a setting the operator never touched (#737 review).
         const ffEmbeddedUrl = route?.rewrittenUrl;
         const ffProviderKeys = Object.keys(opts.routes);
         const shrinkNote = buildWindowShrinkNote({
